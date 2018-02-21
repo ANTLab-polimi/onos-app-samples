@@ -23,6 +23,8 @@ import org.apache.felix.scr.annotations.ReferenceCardinality;
 import org.onlab.packet.Ethernet;
 import org.onosproject.core.ApplicationId;
 import org.onosproject.core.CoreService;
+import org.onosproject.net.ConnectPoint;
+import org.onosproject.net.FilteredConnectPoint;
 import org.onosproject.net.Host;
 import org.onosproject.net.HostId;
 import org.onosproject.net.PortNumber;
@@ -31,14 +33,13 @@ import org.onosproject.net.flow.DefaultTrafficTreatment;
 import org.onosproject.net.flow.FlowRuleService;
 import org.onosproject.net.flow.TrafficSelector;
 import org.onosproject.net.flow.TrafficTreatment;
-import org.onosproject.net.flowobjective.DefaultForwardingObjective;
 import org.onosproject.net.flowobjective.FlowObjectiveService;
-import org.onosproject.net.flowobjective.ForwardingObjective;
 import org.onosproject.net.host.HostService;
-import org.onosproject.net.intent.HostToHostIntent;
+import org.onosproject.net.intent.ConnectivityIntent;
 import org.onosproject.net.intent.IntentService;
 import org.onosproject.net.intent.IntentState;
 import org.onosproject.net.intent.Key;
+import org.onosproject.net.intent.PointToPointIntent;
 import org.onosproject.net.packet.DefaultOutboundPacket;
 import org.onosproject.net.packet.InboundPacket;
 import org.onosproject.net.packet.OutboundPacket;
@@ -46,11 +47,13 @@ import org.onosproject.net.packet.PacketContext;
 import org.onosproject.net.packet.PacketPriority;
 import org.onosproject.net.packet.PacketProcessor;
 import org.onosproject.net.packet.PacketService;
+import org.onosproject.net.topology.PathService;
 import org.onosproject.net.topology.TopologyService;
 import org.slf4j.Logger;
 
 import java.util.EnumSet;
 
+import static org.onosproject.net.flow.DefaultTrafficSelector.builder;
 import static org.slf4j.LoggerFactory.getLogger;
 
 /**
@@ -81,6 +84,9 @@ public class IntentReactiveForwarding {
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected FlowObjectiveService flowObjectiveService;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected PathService pathService;
 
     private ReactivePacketProcessor processor = new ReactivePacketProcessor();
     private ApplicationId appId;
@@ -172,63 +178,63 @@ public class IntentReactiveForwarding {
 
     // Install a rule forwarding the packet to the specified port.
     private void setUpConnectivity(PacketContext context, HostId srcId, HostId dstId) {
-        TrafficSelector selector = DefaultTrafficSelector.emptySelector();
+        //Selectors match on the MAC addresses
+        TrafficSelector selectorSrcDst = builder()
+                .matchEthSrc(srcId.mac())
+                .matchEthDst(dstId.mac())
+                .build();
+        TrafficSelector selectorDstSrc = builder()
+                .matchEthSrc(dstId.mac())
+                .matchEthDst(srcId.mac())
+                .build();
         TrafficTreatment treatment = DefaultTrafficTreatment.emptyTreatment();
 
-        Key key;
-        if (srcId.toString().compareTo(dstId.toString()) < 0) {
-            key = Key.of(srcId.toString() + dstId.toString(), appId);
-        } else {
-            key = Key.of(dstId.toString() + srcId.toString(), appId);
-        }
+        // We need to define 2 keys since we use two PointToPoint intents
+        Key keySrcDst, keyDstSrc;
 
-        HostToHostIntent intent = (HostToHostIntent) intentService.getIntent(key);
-        // TODO handle the FAILED state
-        if (intent != null) {
-            if (WITHDRAWN_STATES.contains(intentService.getIntentState(key))) {
-                HostToHostIntent hostIntent = HostToHostIntent.builder()
-                        .appId(appId)
-                        .key(key)
-                        .one(srcId)
-                        .two(dstId)
-                        .selector(selector)
-                        .treatment(treatment)
-                        .build();
+        keySrcDst = Key.of(srcId.toString() + dstId.toString(), appId);
+        keyDstSrc = Key.of(dstId.toString() + srcId.toString(), appId);
 
-                intentService.submit(hostIntent);
-            } else if (intentService.getIntentState(key) == IntentState.FAILED) {
+        ConnectivityIntent intentSrcDst =
+                (ConnectivityIntent) intentService.getIntent(keySrcDst);
+        ConnectivityIntent intentDstSrc =
+                (ConnectivityIntent) intentService.getIntent(keyDstSrc);
 
-                TrafficSelector objectiveSelector = DefaultTrafficSelector.builder()
-                        .matchEthSrc(srcId.mac()).matchEthDst(dstId.mac()).build();
+        // Calculate the connect point each host is connected to
+        FilteredConnectPoint filteredIngressCP = getFilteredConnectPoint(srcId);
+        FilteredConnectPoint filteredEgressCP = getFilteredConnectPoint(dstId);
 
-                TrafficTreatment dropTreatment = DefaultTrafficTreatment.builder()
-                        .drop().build();
+        submitIntent(selectorSrcDst, treatment, keySrcDst, intentSrcDst,
+                     filteredIngressCP, filteredEgressCP);
+        submitIntent(selectorDstSrc, treatment, keyDstSrc, intentDstSrc,
+                     filteredEgressCP, filteredIngressCP);
+    }
 
-                ForwardingObjective objective = DefaultForwardingObjective.builder()
-                        .withSelector(objectiveSelector)
-                        .withTreatment(dropTreatment)
-                        .fromApp(appId)
-                        .withPriority(intent.priority() - 1)
-                        .makeTemporary(DROP_RULE_TIMEOUT)
-                        .withFlag(ForwardingObjective.Flag.VERSATILE)
-                        .add();
-
-                flowObjectiveService.forward(context.outPacket().sendThrough(), objective);
-            }
-
-        } else if (intent == null) {
-            HostToHostIntent hostIntent = HostToHostIntent.builder()
+    private void submitIntent(TrafficSelector selector, TrafficTreatment treatment,
+                              Key key, ConnectivityIntent intent,
+                              FilteredConnectPoint filteredIngressCP,
+                              FilteredConnectPoint filteredEgressCP) {
+        if (intent == null || WITHDRAWN_STATES.contains(intentService.getIntentState(key))
+                || intentService.getIntentState(key) == IntentState.FAILED) {
+            //The intent is in the withdrawn state, we need to re-add it
+            PointToPointIntent ptpIntent = PointToPointIntent.builder()
                     .appId(appId)
                     .key(key)
-                    .one(srcId)
-                    .two(dstId)
+                    .filteredIngressPoint(filteredIngressCP)
+                    .filteredEgressPoint(filteredEgressCP)
                     .selector(selector)
                     .treatment(treatment)
                     .build();
-
-            intentService.submit(hostIntent);
+            intentService.submit(ptpIntent);
         }
+        //TODO check master for IntentState.FAILED state handling with flowObjective
+    }
 
+    private FilteredConnectPoint getFilteredConnectPoint(HostId hostId) {
+        Host h = hostService.getHost(hostId);
+        ConnectPoint cp = pathService.getPaths(hostId, h.location().elementId())
+                .iterator().next().links().get(0).dst();
+        return new FilteredConnectPoint(cp);
     }
 
 }
